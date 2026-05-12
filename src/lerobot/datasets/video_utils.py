@@ -145,12 +145,87 @@ def decode_video_frames(
         backend = get_safe_default_codec()
     if backend == "torchcodec":
         return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s, return_uint8=return_uint8)
-    elif backend in ["pyav", "video_reader"]:
+    elif backend == "pyav":
+        return decode_video_frames_pyav_direct(video_path, timestamps, tolerance_s, return_uint8=return_uint8)
+    elif backend == "video_reader":
         return decode_video_frames_torchvision(
-            video_path, timestamps, tolerance_s, backend, return_uint8=return_uint8
+            video_path, timestamps, tolerance_s, "video_reader", return_uint8=return_uint8
         )
     else:
         raise ValueError(f"Unsupported video backend: {backend}")
+
+
+def decode_video_frames_pyav_direct(
+    video_path: Path | str,
+    timestamps: list[float],
+    tolerance_s: float,
+    return_uint8: bool = False,
+) -> torch.Tensor:
+    """Decode frames with PyAV only (no ``torchvision.io.VideoReader``).
+
+    Many PyTorch wheels ship torchvision without ``VideoReader``; this path uses the ``av`` dependency
+    already required by LeRobot for encoding/dataset I/O.
+    """
+    video_path = str(video_path)
+    first_ts = min(timestamps)
+    last_ts = max(timestamps)
+    loaded_frames: list[torch.Tensor] = []
+    loaded_ts: list[float] = []
+
+    with av.open(video_path) as container:
+        stream = container.streams.video[0]
+        # Match VideoReader(..., keyframes_only=True) intent: seek to a keyframe at/before first_ts
+        try:
+            container.seek(
+                int(first_ts / stream.time_base),
+                backward=True,
+                stream=stream,
+                any_frame=False,
+            )
+        except Exception:
+            try:
+                container.seek(0)
+            except Exception:
+                pass
+
+        for frame in container.decode(stream):
+            if frame.pts is None and getattr(frame, "time", None) is None:
+                continue
+            if getattr(frame, "time", None) is not None:
+                pts_sec = float(frame.time)
+            else:
+                pts_sec = float(frame.pts * stream.time_base)
+            img = frame.to_ndarray(format="rgb24")
+            t_chw = torch.from_numpy(np.asarray(img)).permute(2, 0, 1).contiguous()
+            loaded_frames.append(t_chw)
+            loaded_ts.append(pts_sec)
+            if pts_sec >= last_ts:
+                break
+
+    if not loaded_frames:
+        raise FrameTimestampError(f"No frames decoded from {video_path} (pyav direct).")
+
+    query_ts = torch.tensor(timestamps)
+    loaded_ts_t = torch.tensor(loaded_ts)
+    dist = torch.cdist(query_ts[:, None], loaded_ts_t[:, None], p=1)
+    min_, argmin_ = dist.min(1)
+    is_within_tol = min_ < tolerance_s
+    if not is_within_tol.all():
+        raise FrameTimestampError(
+            f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
+            f"\nqueried timestamps: {query_ts}"
+            f"\nloaded timestamps: {loaded_ts_t}"
+            f"\nvideo: {video_path}"
+            "\nbackend: pyav (direct av)"
+        )
+
+    closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
+
+    if return_uint8:
+        return closest_frames
+
+    closest_frames = closest_frames.type(torch.float32) / 255
+    return closest_frames
 
 
 def decode_video_frames_torchvision(

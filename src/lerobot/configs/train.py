@@ -88,6 +88,9 @@ class TrainPipelineConfig(HubMixin):
     # Note that when resuming a run, the default behavior is to use the configuration from the checkpoint,
     # regardless of what's provided with the training command at the time of resumption.
     resume: bool = False
+    # If True, allow --output_dir to point at an existing directory (otherwise a FileExistsError is raised).
+    # Use with care: a new run may write alongside old checkpoints unless you clear the folder first.
+    overwrite_output_dir: bool = False
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000
@@ -180,10 +183,16 @@ class TrainPipelineConfig(HubMixin):
             else:
                 self.job_name = f"{self.env.type}_{active_cfg.type}"
 
-        if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
+        if (
+            not self.resume
+            and isinstance(self.output_dir, Path)
+            and self.output_dir.is_dir()
+            and not self.overwrite_output_dir
+        ):
             raise FileExistsError(
                 f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
-                f"Please change your output directory so that {self.output_dir} is not overwritten."
+                f"Please change your output directory so that {self.output_dir} is not overwritten, "
+                f"or pass --overwrite_output_dir=true."
             )
         elif not self.output_dir:
             now = dt.datetime.now()
